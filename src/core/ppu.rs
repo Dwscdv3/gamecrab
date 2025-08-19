@@ -80,8 +80,8 @@ impl Ppu {
       let tilemap_idx = tilemap_y as u16 * 32 + tilemap_x as u16;
       let mut tile_id = bus.get(0x9800 + bg_map * 0x400 + tilemap_idx) as u16;
       if alt_tiles && tile_id < 128 { tile_id += 256; }
-      let tile_x = (x - bg_offset_x) % 8;
-      let tile_y = (y - bg_offset_y) % 8;
+      let tile_x = (bg_offset_x + x) % 8;
+      let tile_y = (bg_offset_y + y) % 8;
       let addr = 0x8000 + tile_id as u16 * 16 + tile_y as u16 * 2;
       let lsb = bus.get(addr + 0) >> 7 - tile_x & 1;
       let msb = bus.get(addr + 1) >> 7 - tile_x & 1;
@@ -100,6 +100,7 @@ impl Ppu {
     for &Obj { x: obj_x, y: obj_y, tile_id, attr }
     in bus.oam.objects.iter()
       .filter(|&obj| obj.y <= y + 16 && obj.y > y + 16 - obj_height)
+      .take(10)
     {
       let mut tile_y = y + 16 - obj_y;
       let flip_y = attr >> 6 & 1 > 0;

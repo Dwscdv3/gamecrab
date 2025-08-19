@@ -1,6 +1,6 @@
-use std::{rc::Rc, cell::RefCell};
+use std::{cell::RefCell, fs::File, rc::Rc};
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 
 use super::{bus::Bus, cpu::{Cpu, Interrupt}, clock::Clock, ppu::Ppu};
 
@@ -26,8 +26,8 @@ pub struct Emu {
 }
 
 impl Emu {
-  pub fn new(rom: Mmap) -> Self {
-    let bus = Rc::new(RefCell::new(Bus::new(rom, None)));
+  pub fn new(rom: Mmap, sram: Option<MmapMut>) -> Self {
+    let bus = Rc::new(RefCell::new(Bus::new(rom, sram)));
     let clock = Rc::new(RefCell::new(Clock::new()));
     Self {
       bus: bus.clone(),

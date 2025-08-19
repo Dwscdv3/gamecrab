@@ -1,9 +1,9 @@
-#![windows_subsystem = "windows"]
+#![windows_subsystem = "console"]
 
-use std::{env, fs::File, io, time::Duration};
+use std::{env, fs::{create_dir_all, File}, io, path::Path, time::Duration};
 
 use crossterm::{ExecutableCommand, cursor::MoveTo};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use sdl2::{pixels::PixelFormatEnum, event::Event, rect::Rect, keyboard::Keycode};
 use stopwatch::Stopwatch;
 
@@ -11,10 +11,11 @@ use crate::core::{emu::{Emu, RegHw}, cpu::{Reg16, Reg, Inst}};
 
 mod core;
 
-const FREQ: f64 = 4194304.0;
+const FREQ: f64 = 4194304.0 / 1.0;
 const FAST_FORWARD_FREQ: f64 = FREQ * 2.0;
 const PRINT_DEBUG: bool = true;
-const PRINT_INTERVAL: u32 = 4096;
+// const PRINT_INTERVAL: u32 = 1;
+const PRINT_INTERVAL: u32 = FREQ as u32 / 240;
 const DEBUG_START_FAST_FORWARD_TO: u64 = 0;
 
 const PALETTE: &[(u8, u8, u8)] = &[
@@ -43,10 +44,27 @@ fn main() {
     .create_texture_streaming(PixelFormatEnum::RGB24, 160, 144).unwrap();
   let rom_path = env::args().nth(1)
     .expect("Please provide a ROM path at argument 1.");
-  let rom_file = File::open(rom_path)
+  let rom_file = File::open(&rom_path)
     .expect("Cannot open file.");
   let rom = unsafe { Mmap::map(&rom_file).unwrap() };
-  let mut emu = Emu::new(rom);
+  let sram_size = [0, 0, 0x2000, 0x8000, 0x20000, 0x10000][rom[0x149] as usize];
+  let sram_file = if sram_size > 0 {
+    create_dir_all("save").unwrap();
+    let file_name = Path::new(&rom_path).file_stem().unwrap().to_str().unwrap();
+    let file = File::options()
+      .read(true).write(true).create(true)
+      .open(format!("save/{}.sav", file_name))
+      .unwrap();
+    file.set_len(sram_size as u64).unwrap();
+    Some(file)
+  } else {
+    None
+  };
+  let sram = match sram_file {
+    Some(file) => unsafe { Some(MmapMut::map_mut(&file).unwrap()) },
+    None => None,
+  };
+  let mut emu = Emu::new(rom, sram);
   let uptime = Stopwatch::start_new();
   let mut last_frame_time = Duration::default();
   let mut freq = FREQ;
@@ -126,6 +144,10 @@ fn main() {
             emu.bus.borrow().get(RegHw::LCDC as u16),
             emu.ppu.current_line,
           );
+          println!("ROM={}, SRAM={}",
+            emu.bus.borrow().rom_bank,
+            emu.bus.borrow().sram_bank,
+          );
           print!("Stack   "); {
             let sp = emu.cpu.get_reg_16(Reg16::SP);
             let bus = emu.bus.borrow();
@@ -133,28 +155,28 @@ fn main() {
               print!("{:02X} ", bus.get(addr));
             }
           }
-          print!("... \nTiles   "); {
-            let bus = emu.bus.borrow();
-            for i in 0x8000..0x801B {
-              print!("{:02X} ", bus.get(i));
-            }
-          }
-          println!("...\n\nMap 0 - Visible Area"); {
-            let bus = emu.bus.borrow();
-            for y in 0..18 {
-              for x in 0..20 {
-                print!("{:02X} ", bus.get(0x9800 + y * 32 + x));
-              }
-              println!();
-            }
-          }
-          println!("\nInstruction Log"); {
-            for &(pc, Inst { opcode, operand, operand_16 })
-            in emu.cpu.inst_log.iter().take(10) {
-              println!("{:04X} {:02X} {:02X} {:04X}",
-                pc, opcode, operand, operand_16);
-            }
-          }
+          // print!("... \nTiles   "); {
+          //   let bus = emu.bus.borrow();
+          //   for i in 0x8000..0x801B {
+          //     print!("{:02X} ", bus.get(i));
+          //   }
+          // }
+          // println!("...\n\nMap 0 - Visible Area"); {
+          //   let bus = emu.bus.borrow();
+          //   for y in 0..18 {
+          //     for x in 0..20 {
+          //       print!("{:02X} ", bus.get(0x9800 + y * 32 + x));
+          //     }
+          //     println!();
+          //   }
+          // }
+          // println!("\nInstruction Log"); {
+          //   for &(pc, Inst { opcode, operand, operand_16 })
+          //   in emu.cpu.inst_log.iter().take(20) {
+          //     println!("{:04X} {:02X} {:02X} {:04X}",
+          //       pc, opcode, operand, operand_16);
+          //   }
+          // }
         }
       }
       count_to_next_print -= 1;

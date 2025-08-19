@@ -1,4 +1,4 @@
-use std::{rc::Rc, cell::RefCell, collections::VecDeque};
+use std::{cell::RefCell, collections::{HashSet, VecDeque}, fs::File, io::Write, rc::Rc};
 
 use super::{bus::Bus, clock::Clock, emu::RegHw};
 
@@ -82,9 +82,12 @@ pub struct Cpu {
   sp: u16,
   pc: u16,
   ime: bool,
+  ei_pending: bool,
   halting: bool,
   next_inst_t_state: u64,
   pub inst_log: VecDeque<(u16, Inst)>,
+  trace: HashSet<u32>,
+  log: File,
 }
 
 impl Cpu {
@@ -103,9 +106,12 @@ impl Cpu {
         sp: 0xFFFE,
         pc: 0x0100,
         ime: false,
+        ei_pending: false,
         halting: false,
         next_inst_t_state: 0,
         inst_log: VecDeque::with_capacity(20),
+        trace: HashSet::new(),
+        log: File::create("log.txt").unwrap(),
     }
   }
 
@@ -134,7 +140,7 @@ impl Cpu {
       E => self.e = value,
       H => self.h = value,
       L => self.l = value,
-      F => self.f = value,
+      F => self.f = value & 0xF0,
       AddrBC => self.bus.borrow_mut().set(self.get_reg_16(BC), value),
       AddrDE => self.bus.borrow_mut().set(self.get_reg_16(DE), value),
       AddrHL => self.bus.borrow_mut().set(self.get_reg_16(HL), value),
@@ -229,7 +235,7 @@ impl Cpu {
     self.set_reg(A, result);
     self.set_flag(ZF, result == 0);
     self.set_flag(NF, true);
-    self.set_flag(HF, lhs & 0b_1111 < (rhs & 0b_1111 + carry));
+    self.set_flag(HF, lhs & 0b_1111 < ((rhs & 0b_1111) + carry));
     self.set_flag(CF, (lhs as u16) < rhs as u16 + carry as u16);
   }
   fn and(&mut self, reg: Reg) {
@@ -422,18 +428,35 @@ impl Cpu {
   pub fn tick(&mut self) {
     if self.clock.borrow().get_t_state() < self.next_inst_t_state { return; }
     if self.halting {
-      self.add_cooldown(1);
+      self.delay(1);
       return;
     }
     let mut ir = self.bus.borrow().get(RegHw::IF as u16);
-    ir &= 0b_11111;
+    ir &= 0x1F;
+    ir &= self.bus.borrow().get(RegHw::IE as u16);
     if self.ime && ir > 0 {
       let int_id = 7 - ir.leading_zeros();
       self.bus.borrow_mut().set(RegHw::IF as u16, ir & !(1 << int_id));
       self.ime = false;
       self.push(self.get_reg_16(PC));
       self.jp(0x40 + int_id as u16 * 8);
-      self.add_cooldown(5);
+      self.delay(5);
+    }
+    if self.ei_pending { 
+      self.ime = true;
+      self.ei_pending = false;
+    }
+    if self.pc == 0x5FE6 {
+      self.halting = false;
+    }
+    let bank_pc = if (self.pc as u32) < 0x4000 {
+      self.pc as u32
+    } else {
+      self.bus.borrow().rom_bank as u32 * 0x1000000 + (self.pc as u32)
+    };
+    if !self.trace.contains(&bank_pc) {
+      self.trace.insert(bank_pc);
+      writeln!(self.log, "{:08X}", bank_pc).unwrap();
     }
     let Inst { opcode, operand, operand_16 } = self.next_inst();
     match opcode {
@@ -480,17 +503,33 @@ impl Cpu {
           .set(operand_16 + 1, (self.get_reg_16(SP) >> 8) as u8);
       }
       0x09 | 0x19 | 0x29 | 0x39 => self.add_16(id_to_reg_16(opcode >> 4)),
-      0x10 => todo!("stop"),
+      0x10 => {},
       0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
         let z = self.get_flag(ZF);
         let c = self.get_flag(CF);
         let cond = [true, !z, z, !c, c][opcode as usize - 0x18 >> 3];
         if cond {
           self.jr(operand);
-          self.add_cooldown(1);
+          self.delay(1);
         }
       }
-      0x27 => todo!("daa"),
+      0x27 => {
+        let mut result = self.get_reg(A) as u16;
+        if self.get_flag(NF) {
+          if self.get_flag(HF) {
+            result -= 6;
+            if !self.get_flag(CF) { result &= 0xFF; }
+          }
+          if self.get_flag(CF) { result -= 0x60; }
+        } else {
+          if self.get_flag(HF) || result & 0xF > 9 { result += 0x06; }
+          if self.get_flag(CF) || result > 0x9F    { result += 0x60; }
+        }
+        self.set_reg(A, result as u8);
+        self.set_flag(ZF, result as u8 == 0);
+        self.set_flag(HF, false);
+        self.set_flag(CF, self.get_flag(CF) || result > 0xFF);
+      }
       0x2F => {
         self.set_reg(A, !self.get_reg(A));
         self.set_flag(NF, true);
@@ -525,7 +564,7 @@ impl Cpu {
             self.set_reg_16(PC, stack_top);
           }
           0xD9 => {
-            self.ime = true;
+            self.ei_pending = true;
             let stack_top = self.pop();
             self.set_reg_16(PC, stack_top);
           }
@@ -536,7 +575,7 @@ impl Cpu {
             if cond {
               let stack_top = self.pop();
               self.set_reg_16(PC, stack_top);
-              self.add_cooldown(3);
+              self.delay(3);
             }
           }
         }
@@ -564,8 +603,8 @@ impl Cpu {
             self.jp(self.get_reg_16(HL));
           } else {
             self.jp(operand_16);
+            self.delay(1);
           }
-          self.add_cooldown(1);
         }
       }
       0xC4 | 0xCC | 0xCD | 0xD4 | 0xDC => {
@@ -580,13 +619,14 @@ impl Cpu {
         if cond {
           self.push(self.get_reg_16(PC));
           self.jp(operand_16);
-          self.add_cooldown(3);
+          self.delay(3);
         }
       }
       0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => {
         id_to_alu_op(opcode - 0xC0 >> 3)(self, Imm8(operand));
       }
       0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+        self.push(self.get_reg_16(PC));
         self.jp(opcode as u16 - 0xC7);
       }
       0xCB => {
@@ -606,8 +646,8 @@ impl Cpu {
         }
         if operand & 0b_111 == 6 {
           match operand {
-            0x40..=0x7F => self.add_cooldown(1),
-            _ => self.add_cooldown(2)
+            0x40..=0x7F => self.delay(1),
+            _ => self.delay(2)
           }
         }
       }
@@ -625,20 +665,21 @@ impl Cpu {
           self.bus.borrow_mut().set(addr, self.get_reg(A));
         }
       }
-      0xE8 => {
+      0xE8 | 0xF8 => {
         let sp = self.get_reg_16(SP);
         let result = add_u16_i8(sp, operand as i8);
-        self.set_reg_16(SP, result);
+        self.set_reg_16([SP, HL][opcode as usize - 0xE8 >> 4], result);
         self.set_flag(ZF, false);
         self.set_flag(NF, false);
-        self.set_flag(HF, false); // TODO
-        self.set_flag(CF, false); // TODO
+        self.set_flag(HF, (sp & 0x0F) + (operand as u16 & 0x0F) > 0x0F);
+        self.set_flag(CF, (sp & 0xFF) + (operand as u16 & 0xFF) > 0xFF);
       }
-      0xF3 | 0xFB => self.ime = opcode == 0xFB,
-      0xF8 | 0xF9 => todo!("ld hl, sp + e8 / ld sp, hl"),
+      0xF3 => self.ime = false,
+      0xFB => self.ei_pending = true,
+      0xF9 => self.set_reg_16(SP, self.get_reg_16(HL)),
       _ => self.invalid_opcode()
     }
-    self.add_cooldown(INST_BASE_CYCLES[opcode as usize]);
+    self.delay(INST_BASE_CYCLES[opcode as usize]);
   }
 
   pub fn int_req(&mut self, int: Interrupt) {
@@ -647,7 +688,7 @@ impl Cpu {
     bus.set(RegHw::IF as u16, value);
     if bus.get(RegHw::IE as u16) & value > 0 { self.halting = false; }
   }
-  fn add_cooldown(&mut self, m_cycle: u8) {
+  fn delay(&mut self, m_cycle: u8) {
     self.next_inst_t_state += m_cycle as u64 * 4;
   }
 
